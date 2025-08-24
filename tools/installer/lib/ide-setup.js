@@ -74,6 +74,9 @@ class IdeSetup extends BaseIdeSetup {
       case 'qwen-code': {
         return this.setupQwenCode(installDir, selectedAgent);
       }
+      case 'opencode': {
+        return this.setupOpenCode(installDir, selectedAgent);
+      }
       default: {
         console.log(chalk.yellow(`\nIDE ${ide} not yet supported`));
         return false;
@@ -1435,6 +1438,183 @@ tools: ['changes', 'codebase', 'fetch', 'findTestFiles', 'githubRepo', 'problems
     }
     console.log(chalk.dim(''));
     console.log(chalk.dim('You can modify these settings anytime in .vscode/settings.json'));
+  }
+
+  async setupOpenCode(installDir, selectedAgent) {
+    console.log(chalk.blue('\n🚀 Setting up OpenCode IDE integration...'));
+
+    // Create .opencode directory structure
+    const opencodeDir = path.join(installDir, '.opencode');
+    const agentDir = path.join(opencodeDir, 'agent');
+    const commandDir = path.join(opencodeDir, 'command');
+
+    await fileManager.ensureDirectory(agentDir);
+    await fileManager.ensureDirectory(commandDir);
+
+    console.log(chalk.green('✓ Created .opencode directory structure'));
+
+    // Transform and install agents
+    const agents = selectedAgent ? [selectedAgent] : await this.getAllAgentIds(installDir);
+
+    for (const agentId of agents) {
+      const agentPath = await this.findAgentPath(agentId, installDir);
+
+      if (agentPath) {
+        await this.transformAndInstallAgent(agentId, agentPath, agentDir, installDir);
+      }
+    }
+
+    // Extract and create commands
+    await this.extractAndCreateCommands(commandDir, installDir, agents);
+
+    console.log(chalk.green(`\n✓ OpenCode setup complete!`));
+    console.log(chalk.dim('• Press TAB to cycle through available agents'));
+    console.log(chalk.dim('• Use @agent syntax to delegate to subagents'));
+    console.log(chalk.dim('• Access workflows via *commands or /commands'));
+
+    return true;
+  }
+
+  async transformAndInstallAgent(agentId, agentPath, agentDir, installDir) {
+    const agentContent = await fileManager.readFile(agentPath);
+
+    // Generate OpenCode frontmatter
+    const frontmatter = await this.generateOpenCodeFrontmatter(agentId, agentContent, installDir);
+
+    // Preserve complete agent content with {root} replacement
+    const transformedContent = agentContent.replaceAll('{root}', '.opencode/agent');
+
+    // Combine frontmatter with agent content
+    const opencodeAgentContent = `---\n${frontmatter}---\n\n${transformedContent}`;
+
+    // Write to .opencode/agent/ directory
+    const outputPath = path.join(agentDir, `${agentId}.md`);
+    await fileManager.writeFile(outputPath, opencodeAgentContent);
+
+    console.log(chalk.green(`✓ Transformed agent: ${agentId}.md`));
+  }
+
+  async generateOpenCodeFrontmatter(agentId, agentContent, installDir) {
+    const agentTitle = await this.getAgentTitle(agentId, installDir);
+
+    // Determine mode assignment (primary vs subagent)
+    const primaryAgents = ['pm', 'dev', 'qa', 'architect'];
+    const mode = primaryAgents.includes(agentId) ? 'primary' : 'subagent';
+
+    // Extract description from YAML if available
+    let description = `${agentTitle} agent for BMAD Method workflows`;
+    const yamlMatch = agentContent.match(/```ya?ml\r?\n([\s\S]*?)```/);
+    if (yamlMatch) {
+      const whenToUseMatch = yamlMatch[1].match(/whenToUse:\s*"(.*?)"/);
+      if (whenToUseMatch && whenToUseMatch[1]) {
+        description = whenToUseMatch[1];
+      }
+    }
+
+    // Generate frontmatter
+    const escapedDescription = description.replaceAll('"', String.raw`\"`);
+    let frontmatter = `description: "${escapedDescription}"\n`;
+    frontmatter += `mode: ${mode}\n`;
+    frontmatter += `temperature: 0.7\n`;
+    frontmatter += `tools:\n`;
+    frontmatter += `  - read\n`;
+    frontmatter += `  - write\n`;
+    frontmatter += `  - edit\n`;
+    frontmatter += `  - bash\n`;
+    frontmatter += `  - list\n`;
+    frontmatter += `  - glob\n`;
+    frontmatter += `  - grep\n`;
+
+    return frontmatter;
+  }
+
+  async extractAndCreateCommands(commandDir, installDir, agents) {
+    console.log(chalk.blue('🔧 Extracting and creating commands...'));
+
+    // Priority commands to extract
+    const priorityCommands = new Set(['create-prd', 'develop-story', 'review-qa']);
+    const extractedCommands = [];
+
+    for (const agentId of agents) {
+      const agentPath = await this.findAgentPath(agentId, installDir);
+      if (!agentPath) continue;
+
+      const agentContent = await fileManager.readFile(agentPath);
+      const commands = await this.extractCommandsFromAgent(agentContent);
+
+      for (const command of commands) {
+        if (priorityCommands.has(command.name) && !extractedCommands.includes(command.name)) {
+          await this.createOpenCodeCommandFile(command, commandDir, agentId);
+          extractedCommands.push(command.name);
+        }
+      }
+    }
+
+    console.log(chalk.green(`✓ Created ${extractedCommands.length} command files`));
+  }
+
+  async extractCommandsFromAgent(agentContent) {
+    const commands = [];
+
+    // Extract YAML commands block
+    const yamlMatch = agentContent.match(/```ya?ml\r?\n([\s\S]*?)```/);
+    if (!yamlMatch) return commands;
+
+    try {
+      const yaml = require('js-yaml');
+      const agentConfig = yaml.load(yamlMatch[1]);
+
+      if (agentConfig.commands) {
+        for (const [commandName, commandConfig] of Object.entries(agentConfig.commands)) {
+          if (commandName.startsWith('*')) {
+            commands.push({
+              name: commandName.slice(1), // Remove * prefix
+              description: commandConfig.description || `Execute ${commandName} workflow`,
+              dependencies: commandConfig.dependencies || [],
+              parameters: commandConfig.parameters || [],
+            });
+          }
+        }
+      }
+    } catch (error) {
+      console.warn(`Failed to parse YAML for command extraction: ${error.message}`);
+    }
+
+    return commands;
+  }
+
+  async createOpenCodeCommandFile(command, commandDir, agentId) {
+    const commandContent = `---
+description: ${command.description}
+---
+
+# /${command.name}
+
+Execute the ${command.name} workflow using the BMAD Method.
+
+This command delegates to the **${agentId}** agent to perform ${command.description.toLowerCase()}.
+
+## Usage
+
+\`\`\`
+/${command.name} $ARGUMENTS
+\`\`\`
+
+The command will:
+1. Activate the ${agentId} agent persona
+2. Execute the *${command.name} workflow  
+3. Follow BMAD Method best practices
+4. Generate appropriate deliverables
+
+## Agent Delegation
+
+This command uses the traditional BMAD command system (\`*${command.name}\`) through OpenCode's native command interface (\`/${command.name}\`).
+`;
+
+    const commandPath = path.join(commandDir, `${command.name}.md`);
+    await fileManager.writeFile(commandPath, commandContent);
+
+    console.log(chalk.green(`✓ Created command: /${command.name}.md`));
   }
 }
 
